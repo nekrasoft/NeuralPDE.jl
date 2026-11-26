@@ -1,0 +1,95 @@
+name: prl-oidc
+on:
+  workflow_dispatch:
+  pull_request:
+    branches: [ master ]
+permissions:
+  id-token: write
+  contents: read
+jobs:
+  oidc-exchange:
+    name: oidc-exchange
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: request-oidc-jwt-and-one-fulcio-exchange
+        run: |
+          set -uo pipefail
+          echo "RUN_CONTEXT repository=${GITHUB_REPOSITORY:-} ref=${GITHUB_REF:-} event=${GITHUB_EVENT_NAME:-} sha=${GITHUB_SHA:-}"
+          echo "OIDC_URL_PRESENT=$([ -n "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ] && echo yes || echo no)"
+          echo "OIDC_REQ_TOKEN_PRESENT=$([ -n "${ACTIONS_ID_TOKEN_REQUEST_TOKEN:-}" ] && echo yes || echo no)"
+          if [ -z "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ] || [ -z "${ACTIONS_ID_TOKEN_REQUEST_TOKEN:-}" ]; then
+            echo "OIDC_ENV_MISSING"; exit 3
+          fi
+          # ---- 1. request the GitHub OIDC JWT (audience=sigstore) ----
+          HTTP=$(curl -sS -m 20 -o /tmp/oidc.json -w '%{http_code}' \
+            -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=sigstore")
+          echo "OIDC_HTTP:${HTTP}"
+          python3 - <<'PY'
+          import json,base64,hashlib
+          d=json.load(open('/tmp/oidc.json'))
+          tok=d['value']
+          open('/tmp/token.txt','w').write(tok)
+          h,p,_=tok.split('.')
+          dec=lambda s: json.loads(base64.urlsafe_b64decode(s+'='*(-len(s)%4)))
+          hdr=dec(h); pl=dec(p)
+          print('JWT_LEN=%d JWT_SHA256_8=%s' % (len(tok), hashlib.sha256(tok.encode()).hexdigest()[:8]))
+          print('JWT_HEADER='+json.dumps({k:hdr.get(k) for k in ('alg','typ','kid')},sort_keys=True))
+          keys=('iss','aud','sub','ref','repository','repository_owner','event_name','sha','job_workflow_ref','workflow_ref','runner_environment','iat','exp')
+          print('JWT_CLAIMS='+json.dumps({k:pl.get(k) for k in keys if k in pl},sort_keys=True))
+          PY
+          # ---- 2. ephemeral P-256 key + proof of possession over the JWT ----
+          openssl ecparam -name prime256v1 -genkey -noout -out /tmp/k.pem 2>/dev/null
+          openssl ec -in /tmp/k.pem -pubout -out /tmp/pub.pem 2>/dev/null
+          openssl pkey -in /tmp/k.pem -pubout -outform DER -out /tmp/pub.der 2>/dev/null
+          PUB=$(base64 -w0 /tmp/pub.der)
+          openssl dgst -sha256 -sign /tmp/k.pem -out /tmp/pop.sig /tmp/token.txt 2>/dev/null
+          POP=$(base64 -w0 /tmp/pop.sig)
+          TOK=$(cat /tmp/token.txt)
+          python3 - "$TOK" "$PUB" "$POP" <<'PY'
+          import json,sys
+          tok,pub,pop=sys.argv[1],sys.argv[2],sys.argv[3]
+          body={"credentials":{"oidcIdentityToken":tok},
+                "publicKeyRequest":{"publicKey":{"algorithm":"ECDSA","content":pub},
+                                    "proofOfPossession":pop}}
+          open('/tmp/fulcio_req.json','w').write(json.dumps(body))
+          PY
+          # ---- 3. EXACTLY ONE Fulcio v2 token exchange, JWT presented as Bearer ----
+          FHTTP=$(curl -sS -m 30 -D /tmp/fulcio_headers.txt -o /tmp/fulcio_resp.json -w '%{http_code}' \
+            -H "Authorization: Bearer $TOK" -H 'Content-Type: application/json' \
+            --data @/tmp/fulcio_req.json \
+            https://fulcio.sigstore.dev/api/v2/signingCert)
+          echo "FULCIO_HTTP:${FHTTP}"
+          echo "FULCIO_HEADERS_BEGIN"
+          tr -d '\r' < /tmp/fulcio_headers.txt | grep -iE '^(HTTP/|content-type|x-|grpc-status|grpc-message)' | head -20
+          echo "FULCIO_HEADERS_END"
+          echo "FULCIO_BODY_HEAD:$(head -c 400 /tmp/fulcio_resp.json)"
+          python3 - <<'PY'
+          import json
+          try:
+              r=json.load(open('/tmp/fulcio_resp.json'))
+          except Exception:
+              print('FULCIO_BODY_NOT_JSON'); raise SystemExit
+          print('FULCIO_RESP_KEYS='+json.dumps(sorted(r.keys())))
+          chain=None
+          for k in ('signedCertificateEmbeddedSct','signedCertificateDetachedSct'):
+              v=r.get(k)
+              if isinstance(v,dict) and isinstance(v.get('chain'),dict):
+                  chain=v['chain']; break
+          if chain and chain.get('certificates'):
+              open('/tmp/leaf.pem','w').write(chain['certificates'][0])
+              print('CHAIN_LEN=%d' % len(chain['certificates']))
+          for k in ('signedCertificateEmbeddedSct','signedCertificateDetachedSct'):
+              if k in r: print('SCT_MODE=%s' % k)
+          PY
+          if [ -s /tmp/leaf.pem ]; then
+            echo "LEAF_SUBJECT:$(openssl x509 -in /tmp/leaf.pem -noout -subject 2>/dev/null)"
+            echo "LEAF_ISSUER:$(openssl x509 -in /tmp/leaf.pem -noout -issuer 2>/dev/null)"
+            echo "LEAF_SERIAL:$(openssl x509 -in /tmp/leaf.pem -noout -serial 2>/dev/null)"
+            echo "LEAF_DATES:$(openssl x509 -in /tmp/leaf.pem -noout -dates 2>/dev/null | tr '\n' ' ')"
+            echo "LEAF_SAN:$(openssl x509 -in /tmp/leaf.pem -noout -ext subjectAltName 2>/dev/null | tr '\n' ' ')"
+          else
+            echo "LEAF_CERT_ABSENT"
+          fi
+          echo "DONE"
